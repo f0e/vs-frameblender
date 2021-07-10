@@ -15,7 +15,6 @@ namespace {
     typedef struct {
         VSNodeRef* node;
         VSVideoInfo vi;
-        int gap;
         std::vector<float> fweights;
         bool process[3];
     } FrameBlendData;
@@ -98,16 +97,14 @@ static const VSFrameRef* VS_CC frameBlendGetFrame(int n, int activationReason, v
         VSFrameRef* dst;
         dst = vsapi->newVideoFrame2(fi, vsapi->getFrameWidth(center, 0), vsapi->getFrameHeight(center, 0), fr, pl, center, core);
 
-        if (d->gap == 0 || n % d->gap == 0) {
-            for (int plane = 0; plane < fi->numPlanes; plane++) {
-                if (fi->bytesPerSample == 1)
-                    frameBlend<uint8_t>(d, frames.data(), dst, plane, vsapi);
-                else if (fi->bytesPerSample == 2)
-                    frameBlend<uint16_t>(d, frames.data(), dst, plane, vsapi);
-                else {
-                    vsapi->logMessage(mtFatal, "msg tekno and tell him to fix :alien:");
-                    return nullptr;
-                }
+        for (int plane = 0; plane < fi->numPlanes; plane++) {
+            if (fi->bytesPerSample == 1)
+                frameBlend<uint8_t>(d, frames.data(), dst, plane, vsapi);
+            else if (fi->bytesPerSample == 2)
+                frameBlend<uint16_t>(d, frames.data(), dst, plane, vsapi);
+            else {
+                vsapi->logMessage(mtFatal, "msg tekno and tell him to fix :alien:");
+                return nullptr;
             }
         }
 
