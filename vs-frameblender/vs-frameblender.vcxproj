@@ -87,12 +87,14 @@
     <IncludePath>$(ProjectDir)vapoursynth;$(IncludePath)</IncludePath>
     <OutDir>$(SolutionDir)bin\$(Configuration.toLower())\$(Platform.toLower())\</OutDir>
     <IntDir>$(SolutionDir)build\$(Configuration.toLower())\$(Platform.toLower())\</IntDir>
+    <TargetName>$(ProjectName)-x64</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
     <IncludePath>$(ProjectDir)vapoursynth;$(IncludePath)</IncludePath>
     <OutDir>$(SolutionDir)bin\$(Configuration.toLower())\$(Platform.toLower())\</OutDir>
     <IntDir>$(SolutionDir)build\$(Configuration.toLower())\$(Platform.toLower())\</IntDir>
+    <TargetName>$(ProjectName)-x64</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
