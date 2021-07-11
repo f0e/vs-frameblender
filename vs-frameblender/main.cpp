@@ -11,11 +11,30 @@
 #include <VapourSynth.h>
 #include <VSHelper.h>
 
+static inline void getPlanesArg(const VSMap* in, bool* process, const VSAPI* vsapi) {
+    int m = vsapi->propNumElements(in, "planes");
+
+    for (int i = 0; i < 3; i++)
+        process[i] = (m <= 0);
+
+    for (int i = 0; i < m; i++) {
+        int o = int64ToIntS(vsapi->propGetInt(in, "planes", i, nullptr));
+
+        if (o < 0 || o >= 3)
+            throw std::runtime_error("plane index out of range");
+
+        if (process[o])
+            throw std::runtime_error("plane specified twice");
+
+        process[o] = true;
+    }
+}
+
 namespace {
     typedef struct {
         VSNodeRef* node;
         VSVideoInfo vi;
-        std::vector<float> fweights;
+        std::vector<float> weightPercents;
         bool process[3];
     } FrameBlendData;
 }
@@ -32,7 +51,7 @@ static void frameBlend(const FrameBlendData* d, const VSFrameRef* const* srcs, V
     int height = vsapi->getFrameHeight(dst, plane);
 
     const T* srcpp[128];
-    const size_t numSrcs = d->fweights.size();
+    const size_t numSrcs = d->weightPercents.size();
 
     std::transform(srcs, srcs + numSrcs, srcpp, [=](const VSFrameRef* f) {
         return reinterpret_cast<const T*>(vsapi->getReadPtr(f, plane));
@@ -48,7 +67,7 @@ static void frameBlend(const FrameBlendData* d, const VSFrameRef* const* srcs, V
 
             for (size_t i = 0; i < numSrcs; ++i) {
                 T val = srcpp[i][w];
-                acc += val * (1.f / numSrcs);
+                acc += val * d->weightPercents[i];
             }
 
             int actualAcc = std::clamp(int(acc), 0, int(maxVal));
@@ -63,7 +82,7 @@ static void frameBlend(const FrameBlendData* d, const VSFrameRef* const* srcs, V
 static const VSFrameRef* VS_CC frameBlendGetFrame(int n, int activationReason, void** instanceData, void** frameData, VSFrameContext* frameCtx, VSCore* core, const VSAPI* vsapi) {
     FrameBlendData* d = static_cast<FrameBlendData*>(*instanceData);
 
-    const int half = int(d->fweights.size() / 2);
+    const int half = int(d->weightPercents.size() / 2);
 
     bool clamp = (n > INT_MAX - 1 - half);
     int lastframe = clamp ? INT_MAX - 1 : n + half;
@@ -75,10 +94,10 @@ static const VSFrameRef* VS_CC frameBlendGetFrame(int n, int activationReason, v
     }
     else if (activationReason == arAllFramesReady) {
         // get this frame's frames to be blended
-        std::vector<const VSFrameRef*> frames(d->fweights.size());
+        std::vector<const VSFrameRef*> frames(d->weightPercents.size());
 
         int fn = n - half;
-        for (size_t i = 0; i < d->fweights.size(); i++) {
+        for (size_t i = 0; i < d->weightPercents.size(); i++) {
             frames[i] = vsapi->getFrameFilter(std::max(0, fn), d->node, frameCtx);
             if (fn < INT_MAX - 1)
                 fn++;
@@ -98,13 +117,15 @@ static const VSFrameRef* VS_CC frameBlendGetFrame(int n, int activationReason, v
         dst = vsapi->newVideoFrame2(fi, vsapi->getFrameWidth(center, 0), vsapi->getFrameHeight(center, 0), fr, pl, center, core);
 
         for (int plane = 0; plane < fi->numPlanes; plane++) {
-            if (fi->bytesPerSample == 1)
-                frameBlend<uint8_t>(d, frames.data(), dst, plane, vsapi);
-            else if (fi->bytesPerSample == 2)
-                frameBlend<uint16_t>(d, frames.data(), dst, plane, vsapi);
-            else {
-                vsapi->logMessage(mtFatal, "msg tekno and tell him to fix :alien:");
-                return nullptr;
+            if (d->process[plane]) {
+                if (fi->bytesPerSample == 1)
+                    frameBlend<uint8_t>(d, frames.data(), dst, plane, vsapi);
+                else if (fi->bytesPerSample == 2)
+                    frameBlend<uint16_t>(d, frames.data(), dst, plane, vsapi);
+                else {
+                    vsapi->logMessage(mtFatal, "msg tekno and tell him to fix :alien:");
+                    return nullptr;
+                }
             }
         }
 
@@ -129,10 +150,6 @@ static void VS_CC frameBlendCreate(const VSMap* in, VSMap* out, void* userData, 
     int err;
 
     try {
-        if (numWeights > 127) {
-            throw std::runtime_error("Must use between 1 and 127 weights (if you've actually reached the 127 weight limit then message me and i'll increase it)");
-        }
-
         if ((numWeights % 2) != 1)
             throw std::runtime_error("Number of weights must be odd");
         
@@ -141,8 +158,26 @@ static void VS_CC frameBlendCreate(const VSMap* in, VSMap* out, void* userData, 
         d->vi = *vsapi->getVideoInfo(d->node);
 
         // get weights
+        float totalWeights = 0.f;
         for (int i = 0; i < numWeights; i++)
-            d->fweights.push_back(static_cast<float>(vsapi->propGetFloat(in, "weights", i, 0)));
+            totalWeights += vsapi->propGetFloat(in, "weights", i, 0);
+
+        // scale weights
+        for (int i = 0; i < numWeights; i++)
+            d->weightPercents.push_back(vsapi->propGetFloat(in, "weights", i, 0) / totalWeights);
+
+        // logging
+        std::string weightStr;
+        for (auto& weight : d->weightPercents) {
+            if (weightStr != "")
+                weightStr += ", ";
+
+            weightStr += std::to_string(weight);
+        }
+
+        vsapi->logMessage(mtDebug, ("Frame blending with weights [" + weightStr + "]").c_str());
+
+        getPlanesArg(in, d->process, vsapi);
     }
     catch (const std::runtime_error& e) {
         vsapi->freeNode(d->node);
@@ -152,8 +187,6 @@ static void VS_CC frameBlendCreate(const VSMap* in, VSMap* out, void* userData, 
 
     vsapi->createFilter(in, out, "FrameBlend", frameBlendInit, frameBlendGetFrame, frameBlendFree, fmParallel, 0, d.release(), core);
 }
-
-// init
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin* plugin) {
     configFunc("com.vapoursynth.frameblender", "frameblender", "Frame blender", VAPOURSYNTH_API_VERSION, 1, plugin);
