@@ -50,7 +50,7 @@ static void frameBlend(const FrameBlendData* d, const VSFrameRef* const* srcs, V
     int width = vsapi->getFrameWidth(dst, plane);
     int height = vsapi->getFrameHeight(dst, plane);
 
-    const T* srcpp[128];
+    const T* srcpp[512];
     const size_t numSrcs = d->weightPercents.size();
 
     std::transform(srcs, srcs + numSrcs, srcpp, [=](const VSFrameRef* f) {
