@@ -9,8 +9,10 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace fb {
 
@@ -23,6 +25,11 @@ struct PlaneJob {
     ptrdiff_t stride;
     int32_t bias;    // chroma midpoint, 0 for luma and rgb
     int32_t maxval;
+    // reference black and white the curve is anchored to, in sample units. full range is 0 and
+    // maxval; limited range footage is 16 and 219 wide at 8 bit, which leaves superwhite above
+    // the curve's 1.0 instead of clipped off at it. unused when the curve is off.
+    float black;
+    float span;
 };
 
 // ties to even, matching SSE cvtps_epi32 and upstream AverageFrames.
@@ -143,25 +150,129 @@ static inline void blend_float_body(const PlaneJob &j, const float *weights, flo
     }
 }
 
+// squared blend: average in a squared domain instead of a linear one, f^-1(sum w f(v)), per
+// channel. a camera integrates light, not the gamma-encoded codes a file stores, so averaging
+// the codes directly comes out darker than a real exposure on every moving edge. squaring is a
+// close enough stand-in for undoing the transfer - within about 0.02 of a real 2.2 blend
+// everywhere - and it keeps the inverse exact and the loop free of anything but a multiply.
+//
+//   f(v) = v|v|        f^-1(y) = sign(y) * sqrt(|y|)
+//
+// in normalised units where 0 is reference black and 1 reference white. v|v| rather than v*v so
+// sub-black stays ordered and invertible, and superwhite runs past 1.0 rather than clipping.
+static inline float squared_fwd(float v) {
+    return v * std::fabs(v);
+}
+
+static inline float squared_inv(float y) {
+    return std::copysign(std::sqrt(std::fabs(y)), y);
+}
+
+// integer input, bright blend. samples are normalised to the clip's own black and white on the
+// way in - that is what leaves superwhite running past 1.0 instead of clipped at it - and a
+// float accumulator carries whatever the curve does at either end. no level table: the curve
+// is a few flops, where a table costs a gather in the loop that runs once per source frame.
+// bias is not read, because the curve is refused on chroma planes at filter creation.
+template <class T>
+static inline void blend_squared_int_body(const PlaneJob &j, const float *weights, float rscale,
+                                          float *__restrict acc) {
+    const uint8_t *const *const srcs = j.srcs;
+    const unsigned num_srcs = j.num_srcs;
+    uint8_t *const dst_base = j.dst;
+    const unsigned w = j.w;
+    const unsigned h = j.h;
+    const ptrdiff_t stride = j.stride;
+    const int32_t maxval = j.maxval;
+    const float black = j.black;
+    const float span = j.span;
+    const float rspan = 1.0f / span;
+
+    for (unsigned y = 0; y < h; ++y) {
+        T *__restrict dst = reinterpret_cast<T *>(dst_base + static_cast<ptrdiff_t>(y) * stride);
+
+        for (unsigned x = 0; x < w; ++x)
+            acc[x] = 0.0f;
+
+        for (unsigned k = 0; k < num_srcs; ++k) {
+            const T *__restrict row =
+                reinterpret_cast<const T *>(srcs[k] + static_cast<ptrdiff_t>(y) * stride);
+            const float wk = weights[k];
+            for (unsigned x = 0; x < w; ++x)
+                acc[x] += squared_fwd((static_cast<float>(row[x]) - black) * rspan) * wk;
+        }
+
+        for (unsigned x = 0; x < w; ++x) {
+            const int32_t r = round_nearest_i32(black + span * squared_inv(acc[x] * rscale));
+            dst[x] = static_cast<T>(std::min(std::max(r, 0), maxval));
+        }
+    }
+}
+
+static inline void blend_squared_float_body(const PlaneJob &j, const float *weights, float rscale,
+                                            float *__restrict acc) {
+    const uint8_t *const *const srcs = j.srcs;
+    const unsigned num_srcs = j.num_srcs;
+    uint8_t *const dst_base = j.dst;
+    const unsigned w = j.w;
+    const unsigned h = j.h;
+    const ptrdiff_t stride = j.stride;
+    const float black = j.black;
+    const float span = j.span;
+    const float rspan = 1.0f / span;
+
+    for (unsigned y = 0; y < h; ++y) {
+        float *__restrict dst =
+            reinterpret_cast<float *>(dst_base + static_cast<ptrdiff_t>(y) * stride);
+
+        for (unsigned x = 0; x < w; ++x)
+            acc[x] = 0.0f;
+
+        for (unsigned k = 0; k < num_srcs; ++k) {
+            const float *__restrict row =
+                reinterpret_cast<const float *>(srcs[k] + static_cast<ptrdiff_t>(y) * stride);
+            const float wk = weights[k];
+            for (unsigned x = 0; x < w; ++x)
+                acc[x] += squared_fwd((row[x] - black) * rspan) * wk;
+        }
+
+        for (unsigned x = 0; x < w; ++x)
+            dst[x] = black + span * squared_inv(acc[x] * rscale);
+    }
+}
+
 // one set of these per ISA translation unit
 #define FB_DECLARE_KERNELS(suffix)                                                                 \
     void blend_u8_##suffix(const PlaneJob &, const int32_t *weights, int32_t scale, int32_t *acc); \
     void blend_u16_##suffix(const PlaneJob &, const float *weights, float rscale, float *acc);     \
-    void blend_f32_##suffix(const PlaneJob &, const float *weights, float rscale, float *acc);
+    void blend_f32_##suffix(const PlaneJob &, const float *weights, float rscale, float *acc);     \
+    void blend_squared_u8_##suffix(const PlaneJob &, const float *weights, float rscale,           \
+                                   float *acc);                                                    \
+    void blend_squared_u16_##suffix(const PlaneJob &, const float *weights, float rscale,          \
+                                    float *acc);                                                   \
+    void blend_squared_f32_##suffix(const PlaneJob &, const float *weights, float rscale,          \
+                                    float *acc);
 
 FB_DECLARE_KERNELS(baseline)
 FB_DECLARE_KERNELS(avx2)
 FB_DECLARE_KERNELS(avx512)
 
-#define FB_DEFINE_KERNELS(suffix)                                                          \
-    void blend_u8_##suffix(const PlaneJob &j, const int32_t *w, int32_t s, int32_t *acc) {  \
-        blend_int_body<uint8_t>(j, w, s, acc);                                              \
-    }                                                                                       \
-    void blend_u16_##suffix(const PlaneJob &j, const float *w, float rs, float *acc) {      \
-        blend_int_via_float_body<uint16_t>(j, w, rs, acc);                                  \
-    }                                                                                       \
-    void blend_f32_##suffix(const PlaneJob &j, const float *w, float rs, float *acc) {      \
-        blend_float_body(j, w, rs, acc);                                                    \
+#define FB_DEFINE_KERNELS(suffix)                                                                  \
+    void blend_u8_##suffix(const PlaneJob &j, const int32_t *w, int32_t s, int32_t *acc) {         \
+        blend_int_body<uint8_t>(j, w, s, acc);                                                     \
+    }                                                                                              \
+    void blend_u16_##suffix(const PlaneJob &j, const float *w, float rs, float *acc) {             \
+        blend_int_via_float_body<uint16_t>(j, w, rs, acc);                                         \
+    }                                                                                              \
+    void blend_f32_##suffix(const PlaneJob &j, const float *w, float rs, float *acc) {             \
+        blend_float_body(j, w, rs, acc);                                                           \
+    }                                                                                              \
+    void blend_squared_u8_##suffix(const PlaneJob &j, const float *w, float rs, float *acc) {      \
+        blend_squared_int_body<uint8_t>(j, w, rs, acc);                                            \
+    }                                                                                              \
+    void blend_squared_u16_##suffix(const PlaneJob &j, const float *w, float rs, float *acc) {     \
+        blend_squared_int_body<uint16_t>(j, w, rs, acc);                                           \
+    }                                                                                              \
+    void blend_squared_f32_##suffix(const PlaneJob &j, const float *w, float rs, float *acc) {     \
+        blend_squared_float_body(j, w, rs, acc);                                                   \
     }
-
 } // namespace fb

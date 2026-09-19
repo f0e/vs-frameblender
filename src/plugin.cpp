@@ -103,6 +103,28 @@ void blend_f32(const PlaneJob &j, const float *w, float rs, float *acc) {
     }
 }
 
+void blend_squared_u8(const PlaneJob &j, const float *w, float rs, float *acc) {
+    switch (g_isa) {
+    case Isa::Avx512: fb::blend_squared_u8_avx512(j, w, rs, acc); return;
+    case Isa::Avx2:   fb::blend_squared_u8_avx2(j, w, rs, acc); return;
+    default:          fb::blend_squared_u8_baseline(j, w, rs, acc); return;
+    }
+}
+void blend_squared_u16(const PlaneJob &j, const float *w, float rs, float *acc) {
+    switch (g_isa) {
+    case Isa::Avx512: fb::blend_squared_u16_avx512(j, w, rs, acc); return;
+    case Isa::Avx2:   fb::blend_squared_u16_avx2(j, w, rs, acc); return;
+    default:          fb::blend_squared_u16_baseline(j, w, rs, acc); return;
+    }
+}
+void blend_squared_f32(const PlaneJob &j, const float *w, float rs, float *acc) {
+    switch (g_isa) {
+    case Isa::Avx512: fb::blend_squared_f32_avx512(j, w, rs, acc); return;
+    case Isa::Avx2:   fb::blend_squared_f32_avx2(j, w, rs, acc); return;
+    default:          fb::blend_squared_f32_baseline(j, w, rs, acc); return;
+    }
+}
+
 struct BlendData {
     VSNode *node = nullptr;
     VSVideoInfo vi{};
@@ -111,6 +133,9 @@ struct BlendData {
     int32_t iscale = 1;
     float frscale = 1.0f;
     bool process[3] = { true, true, true };
+    bool use_squared = false;
+    float black = 0.0f;           // reference black and white the curve is anchored to
+    float span = 1.0f;
 };
 
 const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceData,
@@ -167,20 +192,30 @@ const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceDa
         job.stride = vsapi->getStride(center, plane);
         job.bias = 0;
         job.maxval = 0;
+        job.black = d->black;
+        job.span = d->span;
 
         if (fi->sampleType == stInteger) {
             job.maxval = (1 << fi->bitsPerSample) - 1;
             job.bias = chroma ? (1 << (fi->bitsPerSample - 1)) : 0;
-            if (fi->bytesPerSample == 1) {
+            if (facc.size() < job.w) facc.resize(job.w);
+            if (d->use_squared) {
+                if (fi->bytesPerSample == 1)
+                    blend_squared_u8(job, d->fweights.data(), d->frscale, facc.data());
+                else
+                    blend_squared_u16(job, d->fweights.data(), d->frscale, facc.data());
+            } else if (fi->bytesPerSample == 1) {
                 if (iacc.size() < job.w) iacc.resize(job.w);
                 blend_u8(job, d->iweights.data(), d->iscale, iacc.data());
             } else {
-                if (facc.size() < job.w) facc.resize(job.w);
                 blend_u16(job, d->fweights.data(), d->frscale, facc.data());
             }
         } else {
             if (facc.size() < job.w) facc.resize(job.w);
-            blend_f32(job, d->fweights.data(), d->frscale, facc.data());
+            if (d->use_squared)
+                blend_squared_f32(job, d->fweights.data(), d->frscale, facc.data());
+            else
+                blend_f32(job, d->fweights.data(), d->frscale, facc.data());
         }
     }
 
@@ -213,6 +248,9 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
     if (d->vi.format.sampleType == stInteger && d->vi.format.bytesPerSample > 2)
         return fail("only 8-16 bit integer and 32 bit float are supported");
 
+    int squared_err = 0;
+    const bool use_squared = vsapi->mapGetInt(in, "squared", 0, &squared_err) && !squared_err;
+
     const int numWeights = vsapi->mapNumElements(in, "weights");
     if (numWeights < 1)
         return fail("at least one weight is required");
@@ -240,7 +278,7 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
 
     // 8 bit path quantises the weights. pick the largest multiplier that still cannot overflow
     // the int32 accumulator, which leaves the rounding error far below one level.
-    if (d->vi.format.sampleType == stInteger && d->vi.format.bytesPerSample == 1) {
+    if (!use_squared && d->vi.format.sampleType == stInteger && d->vi.format.bytesPerSample == 1) {
         const double headroom = 2147483647.0 * 0.9;
         double mult = headroom / (255.0 * sumabs);
         mult = std::min(mult, 4194304.0);
@@ -255,6 +293,7 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
             return fail("scale underflowed after quantisation");
     }
 
+
     const int numPlanes = vsapi->mapNumElements(in, "planes");
     if (numPlanes > 0) {
         for (bool &p : d->process)
@@ -265,6 +304,46 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
                 return fail("plane index out of range");
             d->process[p] = true;
         }
+    }
+
+
+
+    d->use_squared = use_squared;
+    if (d->use_squared) {
+        const VSVideoFormat &f = d->vi.format;
+
+        // a curve about the chroma midpoint has no meaning - the emphasis has to be applied per
+        // colour channel, or bright saturated things come out bright and washed out
+        if (f.colorFamily == cfYUV && (d->process[1] || d->process[2]))
+            return fail("the squared blend cannot be applied to chroma - convert to rgb, or pass planes=[0]");
+
+        // the curve is anchored to the clip's own black and white, taken from _ColorRange rather
+        // than made the caller's problem. limited range sits at 16..235, and expanding it to fill
+        // 0..255 first is what throws superwhite away - anchored here, samples above white just
+        // run past the curve's 1.0, which a float accumulator handles fine
+        char msg[256] = { 0 };
+        const VSFrame *first = vsapi->getFrame(0, d->node, msg, sizeof(msg));
+        if (!first)
+            return fail(std::string("could not read the first frame for _ColorRange: ") + msg);
+
+        int range_err = 0;
+        const int64_t range =
+            vsapi->mapGetInt(vsapi->getFramePropertiesRO(first), "_ColorRange", 0, &range_err);
+        vsapi->freeFrame(first);
+        const bool limited = !range_err && range == 1;
+
+        // float is already normalised so black is 0 and white is 1 whichever range it came from,
+        // and anything the source had above white simply sits above 1
+        if (f.sampleType == stFloat || !limited) {
+            d->black = 0.0f;
+            d->span = f.sampleType == stFloat ? 1.0f
+                                              : static_cast<float>((1 << f.bitsPerSample) - 1);
+        } else {
+            const int shift = f.bitsPerSample - 8;
+            d->black = static_cast<float>(16 << shift);
+            d->span = static_cast<float>(219 << shift);
+        }
+
     }
 
     VSFilterDependency deps[] = { { d->node, rpGeneral } };
@@ -282,9 +361,10 @@ void VS_CC isaInfo(const VSMap *in, VSMap *out, void *userData, VSCore *core, co
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     vspapi->configPlugin("com.f0e.frameblender", "frameblender", "Frame blender",
-                         VS_MAKE_VERSION(2, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+                         VS_MAKE_VERSION(3, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("FrameBlend",
-                             "clip:vnode;weights:float[];scale:float:opt;planes:int[]:opt;",
+                             "clip:vnode;weights:float[];scale:float:opt;planes:int[]:opt;"
+                             "squared:int:opt;",
                              "clip:vnode;", blendCreate, nullptr, plugin);
     vspapi->registerFunction("Isa", "", "isa:data;", isaInfo, nullptr, plugin);
 }
