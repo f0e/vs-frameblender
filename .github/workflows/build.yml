@@ -1,0 +1,57 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            ext: dll
+          - os: ubuntu-latest
+            name: linux-x64
+            ext: so
+          - os: macos-latest
+            name: macos-arm64
+            ext: dylib
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: build
+        run: cmake --build build --config Release
+
+      - name: collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          find build -name 'frameblender.${{ matrix.ext }}' -exec cp {} 'dist/frameblender-${{ matrix.name }}.${{ matrix.ext }}' \;
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frameblender-${{ matrix.name }}
+          path: dist/*
+
+      - name: upload to release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload '${{ github.event.release.tag_name }}' dist/* --clobber
