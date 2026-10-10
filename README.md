@@ -19,7 +19,7 @@ core.frameblender.FrameBlend(clip, weights=[...], scale=None, planes=None, squar
 - `planes` — which planes to process. Defaults to all.
 - `squared` — average in a squared domain rather than a linear one, so the blend adds up light
   rather than gamma-encoded codes. `False` (the default) dispatches to the plain kernels and
-  costs nothing. RGB and GRAY only; see below.
+  costs nothing. On YUV it runs in RGB; see below.
 
 Frames past the start and end of the clip are clamped to the first/last frame.
 8–16 bit integer and 32 bit float are supported.
@@ -71,10 +71,13 @@ To anchor somewhere else, set `_ColorRange` on the clip — there is no separate
 
 ### Notes
 
-It only applies to RGB and GRAY. A curve about the chroma midpoint has no meaning, so
-`squared=True` on a YUV clip is an error unless `planes` excludes chroma — and squaring luma
-alone desaturates, because the chroma still averages linearly and a bright saturated thing comes
-out bright and washed out. Convert to RGB.
+A curve about the chroma midpoint has no meaning, and squaring luma alone desaturates, because
+the chroma still averages linearly and a bright saturated thing comes out bright and washed out.
+So on YUV each pixel is converted to RGB inside the blend with the clip's `_Matrix` (1, 5, 6 or
+9), put through the curve, and converted back, which saves converting every frame of the window
+outside it. `planes` has to be all of them, or just luma. 4:2:0 and 4:2:2 chroma is taken as left
+sited and brought up bilinearly, and only what the curve changes goes back down, so a static frame
+comes back exact.
 
 The squared blend is not free — the accumulate loop is where all the work is, and it gains a
 normalise, a multiply and an fma per sample:

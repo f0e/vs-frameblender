@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 namespace fb {
 
@@ -240,8 +241,203 @@ static inline void blend_squared_float_body(const PlaneJob &j, const float *weig
     }
 }
 
+// squared blend straight from yuv, so it doesn't need a conversion to rgb and back around it. each
+// source pixel goes to rgb in float, through the curve, into three accumulators, and the result
+// comes back to yuv on the way out. subsampled chroma is taken as mpeg-2 sited (left, and centred
+// vertically) and brought up to the luma's size bilinearly. only what the curve changes goes back
+// down through a [1 2 1] / box filter, on top of a plain blend of the chroma at its own size, so
+// the resampling doesn't soften chroma the curve leaves alone (a still frame comes back exact)
+struct YuvJob {
+    const uint8_t *const *srcs[3];
+    unsigned num_srcs;
+    uint8_t *dst[3];
+    unsigned w;
+    unsigned h;
+    unsigned ssw, ssh;
+    ptrdiff_t stride[3];
+    int32_t maxval;
+    float black;       // luma reference black and white, in sample units
+    float span;
+    float mid;         // chroma zero and the distance to its extremes
+    float cspan;
+    float kr, kb;      // matrix luma coefficients
+};
+
+// floats of scratch blend_squared_yuv needs for a row of `w`
+inline size_t yuv_scratch(unsigned w) {
+    return static_cast<size_t>(w) * 20;
+}
+
+template <class T>
+static inline float yuv_load(const uint8_t *row, unsigned x) {
+    return static_cast<float>(reinterpret_cast<const T *>(row)[x]);
+}
+
+template <class T>
+static inline void yuv_store(uint8_t *row, unsigned x, float v, int32_t maxval) {
+    if constexpr (std::is_same_v<T, float>) {
+        reinterpret_cast<float *>(row)[x] = v;
+    } else {
+        const int32_t r = round_nearest_i32(v);
+        reinterpret_cast<T *>(row)[x] = static_cast<T>(std::min(std::max(r, 0), maxval));
+    }
+}
+
+// one chroma row normalised and at the luma's width. `near` and `far` are the chroma rows either
+// side of the luma row
+template <class T>
+static inline void yuv_chroma_row(const uint8_t *near, const uint8_t *far, float far_weight,
+                                  unsigned cw, bool ssw, float mid, float rcspan,
+                                  float *__restrict row, float *__restrict up) {
+    const float near_weight = 1.0f - far_weight;
+    for (unsigned i = 0; i < cw; ++i)
+        row[i] = (near_weight * yuv_load<T>(near, i) + far_weight * yuv_load<T>(far, i) - mid) * rcspan;
+
+    if (!ssw)
+        return;
+    for (unsigned i = 0; i + 1 < cw; ++i) {
+        up[2 * i] = row[i];
+        up[2 * i + 1] = 0.5f * (row[i] + row[i + 1]);
+    }
+    up[2 * (cw - 1)] = up[2 * (cw - 1) + 1] = row[cw - 1];
+}
+
+template <class T>
+static inline void blend_squared_yuv_body(const YuvJob &j, const float *weights, float rscale,
+                                          float *__restrict scratch) {
+    const unsigned num_srcs = j.num_srcs;
+    const unsigned w = j.w;
+    const bool ssw = j.ssw != 0, ssh = j.ssh != 0;
+    const unsigned rows = ssh ? 2 : 1;
+    const unsigned cw = w >> j.ssw;
+    const unsigned ch = j.h >> j.ssh;
+    const int32_t maxval = j.maxval;
+    const float black = j.black, span = j.span, rspan = 1.0f / span;
+    const float mid = j.mid, cspan = j.cspan, rcspan = 1.0f / cspan;
+    const float kr = j.kr, kb = j.kb, kg = 1.0f - kr - kb;
+    const float rv = 2.0f * (1.0f - kr), bu = 2.0f * (1.0f - kb);
+    const float gv = rv * kr / kg, gu = bu * kb / kg;
+    const ptrdiff_t s1 = j.stride[1], s2 = j.stride[2];
+
+    float *const acc = scratch;                  // r, g, b for each luma row of the group
+    float *const row_u = acc + 3 * 2 * w;
+    float *const row_v = row_u + w;
+    float *const up_u = row_v + w;
+    float *const up_v = up_u + w;
+    float *const out_u = up_v + w;               // each luma row's chroma before it's shrunk
+    float *const out_v = out_u + 2 * w;
+    float *const lin_up_u = out_v + 2 * w;       // the plain blend of the upsampled chroma
+    float *const lin_up_v = lin_up_u + 2 * w;
+    float *const lin_u = lin_up_v + 2 * w;       // and of the chroma at its own size
+    float *const lin_v = lin_u + w;
+    const bool sub = ssw || ssh;
+
+    for (unsigned cy = 0; cy < ch; ++cy) {
+        for (unsigned x = 0; x < 3 * rows * w; ++x)
+            acc[x] = 0.0f;
+        if (sub) {
+            for (unsigned x = 0; x < 2 * w; ++x)
+                lin_up_u[x] = lin_up_v[x] = 0.0f;
+            for (unsigned i = 0; i < cw; ++i)
+                lin_u[i] = lin_v[i] = 0.0f;
+        }
+
+        for (unsigned k = 0; k < num_srcs; ++k) {
+            const float wk = weights[k];
+            const uint8_t *const cu = j.srcs[1][k];
+            const uint8_t *const cv = j.srcs[2][k];
+
+            if (sub) {
+                const uint8_t *nu = cu + cy * s1, *nv = cv + cy * s2;
+                for (unsigned i = 0; i < cw; ++i) {
+                    lin_u[i] += (yuv_load<T>(nu, i) - mid) * rcspan * wk;
+                    lin_v[i] += (yuv_load<T>(nv, i) - mid) * rcspan * wk;
+                }
+            }
+
+            for (unsigned r = 0; r < rows; ++r) {
+                const unsigned far = !ssh ? cy : (r == 0 ? (cy ? cy - 1 : 0) : std::min(cy + 1, ch - 1));
+                const float far_weight = ssh ? 0.25f : 0.0f;
+                yuv_chroma_row<T>(cu + cy * s1, cu + far * s1, far_weight, cw, ssw, mid, rcspan, row_u, up_u);
+                yuv_chroma_row<T>(cv + cy * s2, cv + far * s2, far_weight, cw, ssw, mid, rcspan, row_v, up_v);
+                const float *__restrict pu = ssw ? up_u : row_u;
+                const float *__restrict pv = ssw ? up_v : row_v;
+
+                const uint8_t *ry = j.srcs[0][k] + static_cast<ptrdiff_t>(cy * rows + r) * j.stride[0];
+                float *__restrict ar = acc + 3 * r * w;
+                float *__restrict ag = ar + w;
+                float *__restrict ab = ag + w;
+                if (sub) {
+                    float *__restrict lu = lin_up_u + r * w;
+                    float *__restrict lv = lin_up_v + r * w;
+                    for (unsigned x = 0; x < w; ++x) {
+                        lu[x] += pu[x] * wk;
+                        lv[x] += pv[x] * wk;
+                    }
+                }
+                for (unsigned x = 0; x < w; ++x) {
+                    const float l = (yuv_load<T>(ry, x) - black) * rspan;
+                    ar[x] += squared_fwd(l + rv * pv[x]) * wk;
+                    ag[x] += squared_fwd(l - gv * pv[x] - gu * pu[x]) * wk;
+                    ab[x] += squared_fwd(l + bu * pu[x]) * wk;
+                }
+            }
+        }
+
+        for (unsigned r = 0; r < rows; ++r) {
+            const float *ar = acc + 3 * r * w;
+            const float *ag = ar + w;
+            const float *ab = ag + w;
+            uint8_t *dy = j.dst[0] + static_cast<ptrdiff_t>(cy * rows + r) * j.stride[0];
+            for (unsigned x = 0; x < w; ++x) {
+                const float red = squared_inv(ar[x] * rscale);
+                const float green = squared_inv(ag[x] * rscale);
+                const float blue = squared_inv(ab[x] * rscale);
+                const float l = kr * red + kg * green + kb * blue;
+                yuv_store<T>(dy, x, black + span * l, maxval);
+                out_u[r * w + x] = (blue - l) / bu;
+                out_v[r * w + x] = (red - l) / rv;
+                if (sub) {
+                    out_u[r * w + x] -= lin_up_u[r * w + x] * rscale;
+                    out_v[r * w + x] -= lin_up_v[r * w + x] * rscale;
+                }
+            }
+        }
+
+        uint8_t *du = j.dst[1] + static_cast<ptrdiff_t>(cy) * s1;
+        uint8_t *dv = j.dst[2] + static_cast<ptrdiff_t>(cy) * s2;
+        const float rrows = 1.0f / static_cast<float>(rows);
+        auto column = [&](const float *q, unsigned x) {
+            return ssh ? (q[x] + q[w + x]) * rrows : q[x];
+        };
+        for (unsigned i = 0; i < cw; ++i) {
+            float u, v;
+            if (ssw) {
+                const unsigned x = 2 * i, left = x ? x - 1 : 0, right = std::min(x + 1, w - 1);
+                u = 0.25f * column(out_u, left) + 0.5f * column(out_u, x) + 0.25f * column(out_u, right);
+                v = 0.25f * column(out_v, left) + 0.5f * column(out_v, x) + 0.25f * column(out_v, right);
+            } else {
+                u = column(out_u, i);
+                v = column(out_v, i);
+            }
+            if (sub) {
+                u += lin_u[i] * rscale;
+                v += lin_v[i] * rscale;
+            }
+            yuv_store<T>(du, i, mid + cspan * u, maxval);
+            yuv_store<T>(dv, i, mid + cspan * v, maxval);
+        }
+    }
+}
+
 // one set of these per ISA translation unit
 #define FB_DECLARE_KERNELS(suffix)                                                                 \
+    void blend_squared_yuv_u8_##suffix(const YuvJob &, const float *weights, float rscale,         \
+                                       float *acc);                                                \
+    void blend_squared_yuv_u16_##suffix(const YuvJob &, const float *weights, float rscale,        \
+                                        float *acc);                                               \
+    void blend_squared_yuv_f32_##suffix(const YuvJob &, const float *weights, float rscale,        \
+                                        float *acc);                                               \
     void blend_u8_##suffix(const PlaneJob &, const int32_t *weights, int32_t scale, int32_t *acc); \
     void blend_u16_##suffix(const PlaneJob &, const float *weights, float rscale, float *acc);     \
     void blend_f32_##suffix(const PlaneJob &, const float *weights, float rscale, float *acc);     \
@@ -274,5 +470,14 @@ FB_DECLARE_KERNELS(avx512)
     }                                                                                              \
     void blend_squared_f32_##suffix(const PlaneJob &j, const float *w, float rs, float *acc) {     \
         blend_squared_float_body(j, w, rs, acc);                                                   \
+    }                                                                                              \
+    void blend_squared_yuv_u8_##suffix(const YuvJob &j, const float *w, float rs, float *acc) {    \
+        blend_squared_yuv_body<uint8_t>(j, w, rs, acc);                                            \
+    }                                                                                              \
+    void blend_squared_yuv_u16_##suffix(const YuvJob &j, const float *w, float rs, float *acc) {   \
+        blend_squared_yuv_body<uint16_t>(j, w, rs, acc);                                           \
+    }                                                                                              \
+    void blend_squared_yuv_f32_##suffix(const YuvJob &j, const float *w, float rs, float *acc) {   \
+        blend_squared_yuv_body<float>(j, w, rs, acc);                                              \
     }
 } // namespace fb

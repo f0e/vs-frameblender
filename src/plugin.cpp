@@ -125,6 +125,26 @@ void blend_squared_f32(const PlaneJob &j, const float *w, float rs, float *acc) 
     }
 }
 
+void blend_squared_yuv(const fb::YuvJob &j, int bytes, bool flt, const float *w, float rs, float *acc) {
+    switch (g_isa) {
+    case Isa::Avx512:
+        if (flt) fb::blend_squared_yuv_f32_avx512(j, w, rs, acc);
+        else if (bytes == 1) fb::blend_squared_yuv_u8_avx512(j, w, rs, acc);
+        else fb::blend_squared_yuv_u16_avx512(j, w, rs, acc);
+        return;
+    case Isa::Avx2:
+        if (flt) fb::blend_squared_yuv_f32_avx2(j, w, rs, acc);
+        else if (bytes == 1) fb::blend_squared_yuv_u8_avx2(j, w, rs, acc);
+        else fb::blend_squared_yuv_u16_avx2(j, w, rs, acc);
+        return;
+    default:
+        if (flt) fb::blend_squared_yuv_f32_baseline(j, w, rs, acc);
+        else if (bytes == 1) fb::blend_squared_yuv_u8_baseline(j, w, rs, acc);
+        else fb::blend_squared_yuv_u16_baseline(j, w, rs, acc);
+        return;
+    }
+}
+
 struct BlendData {
     VSNode *node = nullptr;
     VSVideoInfo vi{};
@@ -136,6 +156,10 @@ struct BlendData {
     bool use_squared = false;
     float black = 0.0f;           // reference black and white the curve is anchored to
     float span = 1.0f;
+    bool yuv = false;             // squared blend done in rgb from yuv, see YuvJob
+    float mid = 0.0f;
+    float cspan = 1.0f;
+    float kr = 0.0f, kb = 0.0f;
 };
 
 const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceData,
@@ -173,6 +197,38 @@ const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceDa
     std::vector<const uint8_t *> srcs(count);
     std::vector<int32_t> iacc;
     std::vector<float> facc;
+
+    if (d->yuv) {
+        std::vector<const uint8_t *> plane_srcs[3];
+        fb::YuvJob job{};
+        for (int plane = 0; plane < 3; ++plane) {
+            plane_srcs[plane].resize(count);
+            for (int k = 0; k < count; ++k)
+                plane_srcs[plane][k] = vsapi->getReadPtr(frames[k], plane);
+            job.srcs[plane] = plane_srcs[plane].data();
+            job.dst[plane] = vsapi->getWritePtr(dst, plane);
+            job.stride[plane] = vsapi->getStride(center, plane);
+        }
+        job.num_srcs = static_cast<unsigned>(count);
+        job.w = static_cast<unsigned>(vsapi->getFrameWidth(center, 0));
+        job.h = static_cast<unsigned>(vsapi->getFrameHeight(center, 0));
+        job.ssw = static_cast<unsigned>(fi->subSamplingW);
+        job.ssh = static_cast<unsigned>(fi->subSamplingH);
+        job.maxval = fi->sampleType == stInteger ? (1 << fi->bitsPerSample) - 1 : 0;
+        job.black = d->black;
+        job.span = d->span;
+        job.mid = d->mid;
+        job.cspan = d->cspan;
+        job.kr = d->kr;
+        job.kb = d->kb;
+        facc.resize(fb::yuv_scratch(job.w));
+        blend_squared_yuv(job, fi->bytesPerSample, fi->sampleType == stFloat, d->fweights.data(),
+                          d->frscale, facc.data());
+
+        for (int k = 0; k < count; ++k)
+            vsapi->freeFrame(frames[k]);
+        return dst;
+    }
 
     for (int plane = 0; plane < fi->numPlanes; ++plane) {
         if (!d->process[plane])
@@ -313,9 +369,14 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
         const VSVideoFormat &f = d->vi.format;
 
         // a curve about the chroma midpoint has no meaning - the emphasis has to be applied per
-        // colour channel, or bright saturated things come out bright and washed out
-        if (f.colorFamily == cfYUV && (d->process[1] || d->process[2]))
-            return fail("the squared blend cannot be applied to chroma - convert to rgb, or pass planes=[0]");
+        // colour channel, or bright saturated things come out bright and washed out. so with all
+        // of a yuv clip's planes it runs in rgb, converting with the clip's _Matrix
+        const bool chroma = f.colorFamily == cfYUV && (d->process[1] || d->process[2]);
+        if (chroma && !(d->process[0] && d->process[1] && d->process[2]))
+            return fail("the squared blend needs every plane of a yuv clip, or planes=[0]");
+        if (chroma && (f.subSamplingW > 1 || f.subSamplingH > 1))
+            return fail("the squared blend handles 4:4:4, 4:2:2 and 4:2:0 chroma - convert to one of those or rgb");
+        d->yuv = chroma;
 
         // the curve is anchored to the clip's own black and white, taken from _ColorRange rather
         // than made the caller's problem. limited range sits at 16..235, and expanding it to fill
@@ -329,8 +390,21 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
         int range_err = 0;
         const int64_t range =
             vsapi->mapGetInt(vsapi->getFramePropertiesRO(first), "_ColorRange", 0, &range_err);
-        vsapi->freeFrame(first);
         const bool limited = !range_err && range == 1;
+
+        int matrix_err = 0;
+        const int64_t matrix =
+            vsapi->mapGetInt(vsapi->getFramePropertiesRO(first), "_Matrix", 0, &matrix_err);
+        vsapi->freeFrame(first);
+
+        if (d->yuv) {
+            // bt.709, bt.470bg / smpte 170m (601) and bt.2020 non-constant luminance
+            if (matrix_err) return fail("the squared blend on yuv needs _Matrix set");
+            if (matrix == 1) { d->kr = 0.2126f; d->kb = 0.0722f; }
+            else if (matrix == 5 || matrix == 6) { d->kr = 0.299f; d->kb = 0.114f; }
+            else if (matrix == 9) { d->kr = 0.2627f; d->kb = 0.0593f; }
+            else return fail("the squared blend on yuv supports _Matrix 1, 5, 6 and 9");
+        }
 
         // float is already normalised so black is 0 and white is 1 whichever range it came from,
         // and anything the source had above white simply sits above 1
@@ -342,6 +416,14 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
             const int shift = f.bitsPerSample - 8;
             d->black = static_cast<float>(16 << shift);
             d->span = static_cast<float>(219 << shift);
+        }
+
+        if (f.sampleType == stFloat) {
+            d->mid = 0.0f;
+            d->cspan = 1.0f;
+        } else {
+            d->mid = static_cast<float>(1 << (f.bitsPerSample - 1));
+            d->cspan = limited ? static_cast<float>(224 << (f.bitsPerSample - 8)) : d->span;
         }
 
     }
@@ -361,7 +443,7 @@ void VS_CC isaInfo(const VSMap *in, VSMap *out, void *userData, VSCore *core, co
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     vspapi->configPlugin("com.f0e.frameblender", "frameblender", "Frame blender",
-                         VS_MAKE_VERSION(3, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+                         VS_MAKE_VERSION(3, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("FrameBlend",
                              "clip:vnode;weights:float[];scale:float:opt;planes:int[]:opt;"
                              "squared:int:opt;",
