@@ -4,6 +4,7 @@
 // by cpuid at load. see README.md for why the loop order is what it is.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -185,6 +186,36 @@ const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceDa
     const VSFrame *center = frames[radius];
     const VSVideoFormat *fi = vsapi->getVideoFrameFormat(center);
 
+    // a frame repeated in the window (a held frame, a clamped edge, a clip stretched by repeating
+    // frames) is read once with the weights summed. integer weights add exactly. compared by their
+    // pixels' address, since a filter that only touches props hands back a new frame sharing them
+    using Pixels = std::array<const uint8_t *, 3>;
+    std::vector<const VSFrame *> unique;
+    std::vector<Pixels> pixels;
+    std::vector<float> fweights;
+    std::vector<int32_t> iweights;
+    unique.reserve(count);
+    pixels.reserve(count);
+    for (int k = 0; k < count; ++k) {
+        Pixels data{};
+        for (int plane = 0; plane < fi->numPlanes; ++plane)
+            data[plane] = vsapi->getReadPtr(frames[k], plane);
+        const auto at = std::find(pixels.begin(), pixels.end(), data);
+        if (at == pixels.end()) {
+            unique.push_back(frames[k]);
+            pixels.push_back(data);
+            fweights.push_back(d->fweights[k]);
+            if (!d->iweights.empty())
+                iweights.push_back(d->iweights[k]);
+            continue;
+        }
+        const size_t i = static_cast<size_t>(at - pixels.begin());
+        fweights[i] += d->fweights[k];
+        if (!d->iweights.empty())
+            iweights[i] += d->iweights[k];
+    }
+    const int sources = static_cast<int>(unique.size());
+
     const int pl[] = { 0, 1, 2 };
     const VSFrame *fr[] = {
         d->process[0] ? nullptr : center,
@@ -194,7 +225,7 @@ const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceDa
     VSFrame *dst = vsapi->newVideoFrame2(fi, vsapi->getFrameWidth(center, 0),
                                          vsapi->getFrameHeight(center, 0), fr, pl, center, core);
 
-    std::vector<const uint8_t *> srcs(count);
+    std::vector<const uint8_t *> srcs(sources);
     std::vector<int32_t> iacc;
     std::vector<float> facc;
 
@@ -202,14 +233,14 @@ const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceDa
         std::vector<const uint8_t *> plane_srcs[3];
         fb::YuvJob job{};
         for (int plane = 0; plane < 3; ++plane) {
-            plane_srcs[plane].resize(count);
-            for (int k = 0; k < count; ++k)
-                plane_srcs[plane][k] = vsapi->getReadPtr(frames[k], plane);
+            plane_srcs[plane].resize(sources);
+            for (int k = 0; k < sources; ++k)
+                plane_srcs[plane][k] = vsapi->getReadPtr(unique[k], plane);
             job.srcs[plane] = plane_srcs[plane].data();
             job.dst[plane] = vsapi->getWritePtr(dst, plane);
             job.stride[plane] = vsapi->getStride(center, plane);
         }
-        job.num_srcs = static_cast<unsigned>(count);
+        job.num_srcs = static_cast<unsigned>(sources);
         job.w = static_cast<unsigned>(vsapi->getFrameWidth(center, 0));
         job.h = static_cast<unsigned>(vsapi->getFrameHeight(center, 0));
         job.ssw = static_cast<unsigned>(fi->subSamplingW);
@@ -222,7 +253,7 @@ const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceDa
         job.kr = d->kr;
         job.kb = d->kb;
         facc.resize(fb::yuv_scratch(job.w));
-        blend_squared_yuv(job, fi->bytesPerSample, fi->sampleType == stFloat, d->fweights.data(),
+        blend_squared_yuv(job, fi->bytesPerSample, fi->sampleType == stFloat, fweights.data(),
                           d->frscale, facc.data());
 
         for (int k = 0; k < count; ++k)
@@ -234,14 +265,14 @@ const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceDa
         if (!d->process[plane])
             continue;
 
-        for (int k = 0; k < count; ++k)
-            srcs[k] = vsapi->getReadPtr(frames[k], plane);
+        for (int k = 0; k < sources; ++k)
+            srcs[k] = vsapi->getReadPtr(unique[k], plane);
 
         const bool chroma = (plane == 1 || plane == 2) && fi->colorFamily == cfYUV;
 
         PlaneJob job{};
         job.srcs = srcs.data();
-        job.num_srcs = static_cast<unsigned>(count);
+        job.num_srcs = static_cast<unsigned>(sources);
         job.dst = vsapi->getWritePtr(dst, plane);
         job.w = static_cast<unsigned>(vsapi->getFrameWidth(center, plane));
         job.h = static_cast<unsigned>(vsapi->getFrameHeight(center, plane));
@@ -257,21 +288,21 @@ const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceDa
             if (facc.size() < job.w) facc.resize(job.w);
             if (d->use_squared) {
                 if (fi->bytesPerSample == 1)
-                    blend_squared_u8(job, d->fweights.data(), d->frscale, facc.data());
+                    blend_squared_u8(job, fweights.data(), d->frscale, facc.data());
                 else
-                    blend_squared_u16(job, d->fweights.data(), d->frscale, facc.data());
+                    blend_squared_u16(job, fweights.data(), d->frscale, facc.data());
             } else if (fi->bytesPerSample == 1) {
                 if (iacc.size() < job.w) iacc.resize(job.w);
-                blend_u8(job, d->iweights.data(), d->iscale, iacc.data());
+                blend_u8(job, iweights.data(), d->iscale, iacc.data());
             } else {
-                blend_u16(job, d->fweights.data(), d->frscale, facc.data());
+                blend_u16(job, fweights.data(), d->frscale, facc.data());
             }
         } else {
             if (facc.size() < job.w) facc.resize(job.w);
             if (d->use_squared)
-                blend_squared_f32(job, d->fweights.data(), d->frscale, facc.data());
+                blend_squared_f32(job, fweights.data(), d->frscale, facc.data());
             else
-                blend_f32(job, d->fweights.data(), d->frscale, facc.data());
+                blend_f32(job, fweights.data(), d->frscale, facc.data());
         }
     }
 

@@ -21,7 +21,8 @@ core.frameblender.FrameBlend(clip, weights=[...], scale=None, planes=None, squar
   rather than gamma-encoded codes. `False` (the default) dispatches to the plain kernels and
   costs nothing. On YUV it runs in RGB; see below.
 
-Frames past the start and end of the clip are clamped to the first/last frame.
+Frames past the start and end of the clip are clamped to the first/last frame. A frame repeated
+in the window is read once, with its weights summed.
 8–16 bit integer and 32 bit float are supported.
 
 `core.frameblender.Isa()` reports which kernel the CPU dispatch selected (`baseline`, `avx2` or
