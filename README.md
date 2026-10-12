@@ -19,7 +19,7 @@ Temporal weighted average for VapourSynth, with no cap on the number of weights.
 faster than every alternative once the window gets large.
 
 ```python
-core.frameblender.FrameBlend(clip, weights=[...], scale=None, planes=None, squared=False)
+core.frameblender.FrameBlend(clip, weights=[...], scale=None, planes=None, squared=False, transfer=None)
 ```
 
 - `weights` — one float per frame in the window, odd count, centred on the current frame.
@@ -29,6 +29,8 @@ core.frameblender.FrameBlend(clip, weights=[...], scale=None, planes=None, squar
 - `squared` — average in a squared domain rather than a linear one, so the blend adds up light
   rather than gamma-encoded codes. `False` (the default) dispatches to the plain kernels and
   costs nothing. On YUV it runs in RGB; see below.
+- `transfer` — blend the light under a specific transfer curve instead: `"square"` (the same as
+  `squared=True`), `"pq"` or `"hlg"`. See [HDR curves](#hdr-curves).
 
 Frames past the start and end of the clip are clamped to the first/last frame. A frame repeated
 in the window is read once, with its weights summed.
@@ -100,6 +102,31 @@ normalise, a multiply and an fma per sample:
 720p RGB24 in and out, output frames/sec, best of 4 on a 9800X3D. Against the power mean this
 replaced, measured the same way on the same machine: **2.4× at 21 weights and 3.8× at 81** (58
 and 18 fps), all of it from dropping the two tables.
+
+### HDR curves
+
+The square is within a few levels of any SDR curve, but HDR curves are far from it, so `transfer`
+undoes those exactly. Both are mirrored below black and run past 1.0 above white the
+same way the square does.
+
+- `pq` — SMPTE ST 2084, with light normalised so 1.0 is 10000 nits.
+- `hlg` — BT.2100 HLG, blended in scene light (its inverse OETF), so no display has to be assumed.
+
+The curves are evaluated without libm calls so the loops still vectorise: `pow` is a log2 and an
+exp2 by bit manipulation and short series. Against a float64 reference on random frames covering
+sub-black and superwhite, both are within 1 level at 8 and 10 bit and 2 at 16 bit, and within 3e-5 in
+float (pq is the loosest, being two steep powers).
+
+They cost more than the square, all of it in the forward curve that runs once per source sample:
+
+| transfer | yuv420p8 | rgb24 |
+| -------- | -------- | ----- |
+| none     | 718      | 368   |
+| square   | 368      | 376   |
+| hlg      | 152      | 172   |
+| pq       | 42       | 42    |
+
+1080p, 21 weights, windows tiling, output frames/sec, best of 3 on a 9800X3D.
 
 ## Why it's fast
 
@@ -194,3 +221,4 @@ its own. Slightly redundant (three identical copies of a small function) but cor
   stops being a blur at all. Squaring is the transfer function the codes were encoded with, not
   a gain, so it corrects the average without trading blur away for brightness - and is faster.
 - The old version truncated instead of rounding, so output was up to one level darker.
+- 3.2 added `transfer`. `squared=True` still works and is `transfer="square"`.

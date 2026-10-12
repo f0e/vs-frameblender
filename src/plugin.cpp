@@ -82,69 +82,9 @@ Isa detect_isa() {
 
 const Isa g_isa = detect_isa();
 
-void blend_u8(const PlaneJob &j, const int32_t *w, int32_t s, int32_t *acc) {
-    switch (g_isa) {
-    case Isa::Avx512: fb::blend_u8_avx512(j, w, s, acc); return;
-    case Isa::Avx2:   fb::blend_u8_avx2(j, w, s, acc); return;
-    default:          fb::blend_u8_baseline(j, w, s, acc); return;
-    }
-}
-void blend_u16(const PlaneJob &j, const float *w, float rs, float *acc) {
-    switch (g_isa) {
-    case Isa::Avx512: fb::blend_u16_avx512(j, w, rs, acc); return;
-    case Isa::Avx2:   fb::blend_u16_avx2(j, w, rs, acc); return;
-    default:          fb::blend_u16_baseline(j, w, rs, acc); return;
-    }
-}
-void blend_f32(const PlaneJob &j, const float *w, float rs, float *acc) {
-    switch (g_isa) {
-    case Isa::Avx512: fb::blend_f32_avx512(j, w, rs, acc); return;
-    case Isa::Avx2:   fb::blend_f32_avx2(j, w, rs, acc); return;
-    default:          fb::blend_f32_baseline(j, w, rs, acc); return;
-    }
-}
-
-void blend_squared_u8(const PlaneJob &j, const float *w, float rs, float *acc) {
-    switch (g_isa) {
-    case Isa::Avx512: fb::blend_squared_u8_avx512(j, w, rs, acc); return;
-    case Isa::Avx2:   fb::blend_squared_u8_avx2(j, w, rs, acc); return;
-    default:          fb::blend_squared_u8_baseline(j, w, rs, acc); return;
-    }
-}
-void blend_squared_u16(const PlaneJob &j, const float *w, float rs, float *acc) {
-    switch (g_isa) {
-    case Isa::Avx512: fb::blend_squared_u16_avx512(j, w, rs, acc); return;
-    case Isa::Avx2:   fb::blend_squared_u16_avx2(j, w, rs, acc); return;
-    default:          fb::blend_squared_u16_baseline(j, w, rs, acc); return;
-    }
-}
-void blend_squared_f32(const PlaneJob &j, const float *w, float rs, float *acc) {
-    switch (g_isa) {
-    case Isa::Avx512: fb::blend_squared_f32_avx512(j, w, rs, acc); return;
-    case Isa::Avx2:   fb::blend_squared_f32_avx2(j, w, rs, acc); return;
-    default:          fb::blend_squared_f32_baseline(j, w, rs, acc); return;
-    }
-}
-
-void blend_squared_yuv(const fb::YuvJob &j, int bytes, bool flt, const float *w, float rs, float *acc) {
-    switch (g_isa) {
-    case Isa::Avx512:
-        if (flt) fb::blend_squared_yuv_f32_avx512(j, w, rs, acc);
-        else if (bytes == 1) fb::blend_squared_yuv_u8_avx512(j, w, rs, acc);
-        else fb::blend_squared_yuv_u16_avx512(j, w, rs, acc);
-        return;
-    case Isa::Avx2:
-        if (flt) fb::blend_squared_yuv_f32_avx2(j, w, rs, acc);
-        else if (bytes == 1) fb::blend_squared_yuv_u8_avx2(j, w, rs, acc);
-        else fb::blend_squared_yuv_u16_avx2(j, w, rs, acc);
-        return;
-    default:
-        if (flt) fb::blend_squared_yuv_f32_baseline(j, w, rs, acc);
-        else if (bytes == 1) fb::blend_squared_yuv_u8_baseline(j, w, rs, acc);
-        else fb::blend_squared_yuv_u16_baseline(j, w, rs, acc);
-        return;
-    }
-}
+const fb::Kernels &g_kernels = g_isa == Isa::Avx512 ? fb::kernels_avx512()
+                               : g_isa == Isa::Avx2 ? fb::kernels_avx2()
+                                                    : fb::kernels_baseline();
 
 struct BlendData {
     VSNode *node = nullptr;
@@ -154,10 +94,11 @@ struct BlendData {
     int32_t iscale = 1;
     float frscale = 1.0f;
     bool process[3] = { true, true, true };
-    bool use_squared = false;
+    bool use_curve = false;
+    int transfer = fb::TransferSquare;
     float black = 0.0f;           // reference black and white the curve is anchored to
     float span = 1.0f;
-    bool yuv = false;             // squared blend done in rgb from yuv, see YuvJob
+    bool yuv = false;             // curved blend done in rgb from yuv, see YuvJob
     float mid = 0.0f;
     float cspan = 1.0f;
     float kr = 0.0f, kb = 0.0f;
@@ -253,8 +194,10 @@ const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceDa
         job.kr = d->kr;
         job.kb = d->kb;
         facc.resize(fb::yuv_scratch(job.w));
-        blend_squared_yuv(job, fi->bytesPerSample, fi->sampleType == stFloat, fweights.data(),
-                          d->frscale, facc.data());
+        const fb::YuvFn blend = fi->sampleType == stFloat ? g_kernels.curve_yuv_f32[d->transfer]
+                                : fi->bytesPerSample == 1 ? g_kernels.curve_yuv_u8[d->transfer]
+                                                          : g_kernels.curve_yuv_u16[d->transfer];
+        blend(job, fweights.data(), d->frscale, facc.data());
 
         for (int k = 0; k < count; ++k)
             vsapi->freeFrame(frames[k]);
@@ -286,23 +229,23 @@ const VSFrame *VS_CC blendGetFrame(int n, int activationReason, void *instanceDa
             job.maxval = (1 << fi->bitsPerSample) - 1;
             job.bias = chroma ? (1 << (fi->bitsPerSample - 1)) : 0;
             if (facc.size() < job.w) facc.resize(job.w);
-            if (d->use_squared) {
+            if (d->use_curve) {
                 if (fi->bytesPerSample == 1)
-                    blend_squared_u8(job, fweights.data(), d->frscale, facc.data());
+                    g_kernels.curve_u8[d->transfer](job, fweights.data(), d->frscale, facc.data());
                 else
-                    blend_squared_u16(job, fweights.data(), d->frscale, facc.data());
+                    g_kernels.curve_u16[d->transfer](job, fweights.data(), d->frscale, facc.data());
             } else if (fi->bytesPerSample == 1) {
                 if (iacc.size() < job.w) iacc.resize(job.w);
-                blend_u8(job, iweights.data(), d->iscale, iacc.data());
+                g_kernels.blend_u8(job, iweights.data(), d->iscale, iacc.data());
             } else {
-                blend_u16(job, fweights.data(), d->frscale, facc.data());
+                g_kernels.blend_u16(job, fweights.data(), d->frscale, facc.data());
             }
         } else {
             if (facc.size() < job.w) facc.resize(job.w);
-            if (d->use_squared)
-                blend_squared_f32(job, fweights.data(), d->frscale, facc.data());
+            if (d->use_curve)
+                g_kernels.curve_f32[d->transfer](job, fweights.data(), d->frscale, facc.data());
             else
-                blend_f32(job, fweights.data(), d->frscale, facc.data());
+                g_kernels.blend_f32(job, fweights.data(), d->frscale, facc.data());
         }
     }
 
@@ -335,8 +278,20 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
     if (d->vi.format.sampleType == stInteger && d->vi.format.bytesPerSample > 2)
         return fail("only 8-16 bit integer and 32 bit float are supported");
 
+    // squared=True predates transfer, and is the same as transfer="square"
     int squared_err = 0;
-    const bool use_squared = vsapi->mapGetInt(in, "squared", 0, &squared_err) && !squared_err;
+    const bool squared = vsapi->mapGetInt(in, "squared", 0, &squared_err) && !squared_err;
+
+    int transfer_err = 0;
+    const char *transfer = vsapi->mapGetData(in, "transfer", 0, &transfer_err);
+    const bool use_curve = squared || !transfer_err;
+    if (!transfer_err) {
+        const std::string name = transfer;
+        if (name == "square") d->transfer = fb::TransferSquare;
+        else if (name == "pq") d->transfer = fb::TransferPq;
+        else if (name == "hlg") d->transfer = fb::TransferHlg;
+        else return fail("transfer must be one of square, pq and hlg");
+    }
 
     const int numWeights = vsapi->mapNumElements(in, "weights");
     if (numWeights < 1)
@@ -365,7 +320,7 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
 
     // 8 bit path quantises the weights. pick the largest multiplier that still cannot overflow
     // the int32 accumulator, which leaves the rounding error far below one level.
-    if (!use_squared && d->vi.format.sampleType == stInteger && d->vi.format.bytesPerSample == 1) {
+    if (!use_curve && d->vi.format.sampleType == stInteger && d->vi.format.bytesPerSample == 1) {
         const double headroom = 2147483647.0 * 0.9;
         double mult = headroom / (255.0 * sumabs);
         mult = std::min(mult, 4194304.0);
@@ -395,8 +350,8 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
 
 
 
-    d->use_squared = use_squared;
-    if (d->use_squared) {
+    d->use_curve = use_curve;
+    if (d->use_curve) {
         const VSVideoFormat &f = d->vi.format;
 
         // a curve about the chroma midpoint has no meaning - the emphasis has to be applied per
@@ -404,9 +359,9 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
         // of a yuv clip's planes it runs in rgb, converting with the clip's _Matrix
         const bool chroma = f.colorFamily == cfYUV && (d->process[1] || d->process[2]);
         if (chroma && !(d->process[0] && d->process[1] && d->process[2]))
-            return fail("the squared blend needs every plane of a yuv clip, or planes=[0]");
+            return fail("the curved blend needs every plane of a yuv clip, or planes=[0]");
         if (chroma && (f.subSamplingW > 1 || f.subSamplingH > 1))
-            return fail("the squared blend handles 4:4:4, 4:2:2 and 4:2:0 chroma - convert to one of those or rgb");
+            return fail("the curved blend handles 4:4:4, 4:2:2 and 4:2:0 chroma - convert to one of those or rgb");
         d->yuv = chroma;
 
         // the curve is anchored to the clip's own black and white, taken from _ColorRange rather
@@ -430,11 +385,11 @@ void VS_CC blendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core
 
         if (d->yuv) {
             // bt.709, bt.470bg / smpte 170m (601) and bt.2020 non-constant luminance
-            if (matrix_err) return fail("the squared blend on yuv needs _Matrix set");
+            if (matrix_err) return fail("the curved blend on yuv needs _Matrix set");
             if (matrix == 1) { d->kr = 0.2126f; d->kb = 0.0722f; }
             else if (matrix == 5 || matrix == 6) { d->kr = 0.299f; d->kb = 0.114f; }
             else if (matrix == 9) { d->kr = 0.2627f; d->kb = 0.0593f; }
-            else return fail("the squared blend on yuv supports _Matrix 1, 5, 6 and 9");
+            else return fail("the curved blend on yuv supports _Matrix 1, 5, 6 and 9");
         }
 
         // float is already normalised so black is 0 and white is 1 whichever range it came from,
@@ -474,10 +429,10 @@ void VS_CC isaInfo(const VSMap *in, VSMap *out, void *userData, VSCore *core, co
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     vspapi->configPlugin("com.f0e.frameblender", "frameblender", "Frame blender",
-                         VS_MAKE_VERSION(3, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
+                         VS_MAKE_VERSION(3, 2), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction("FrameBlend",
                              "clip:vnode;weights:float[];scale:float:opt;planes:int[]:opt;"
-                             "squared:int:opt;",
+                             "squared:int:opt;transfer:data:opt;",
                              "clip:vnode;", blendCreate, nullptr, plugin);
     vspapi->registerFunction("Isa", "", "isa:data;", isaInfo, nullptr, plugin);
 }
