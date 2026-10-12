@@ -69,4 +69,12 @@ else()
     target_compile_options(frameblender PRIVATE -O3)
 endif()
 
-install(TARGETS frameblender LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+if(SKBUILD)
+    # the wheel install dir is already vapoursynth/plugins, which vapoursynth autoloads from
+    install(TARGETS frameblender
+        LIBRARY DESTINATION .
+        RUNTIME DESTINATION .
+        ARCHIVE DESTINATION . EXCLUDE_FROM_ALL)
+else()
+    install(TARGETS frameblender LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+endif()

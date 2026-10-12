@@ -1,0 +1,38 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "setuptools-scm>=8.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "vapoursynth-frameblender"
+description = "Temporal weighted average for VapourSynth with no cap on the number of weights"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "f0e" }]
+keywords = ["vapoursynth", "blend", "average", "motion blur"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Plugins",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = ["VapourSynth>=74"]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/f0e/vs-frameblender"
+Issues = "https://github.com/f0e/vs-frameblender/issues"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.20"
+ninja.make-fallback = true
+wheel.install-dir = "vapoursynth/plugins"
+wheel.py-api = "py3"
+wheel.expand-macos-universal-tags = true
+sdist.reproducible = true
+metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
+
+[tool.setuptools_scm]

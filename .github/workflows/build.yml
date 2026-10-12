@@ -1,57 +1,78 @@
-name: build
+name: Build
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-  release:
-    types: [published]
-  workflow_dispatch:
+on: [push, pull_request, workflow_dispatch]
 
 jobs:
-  build:
-    permissions:
-      contents: write
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+  build-wheels:
     strategy:
-      fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            name: windows-x64
-            ext: dll
-          - os: ubuntu-latest
-            name: linux-x64
-            ext: so
-          - os: macos-latest
-            name: macos-arm64
-            ext: dylib
+          - arch: linux_x86_64
+            runs-on: ubuntu-latest
+          - arch: linux_aarch64
+            runs-on: ubuntu-24.04-arm
+          - arch: macosx_x86_64
+            runs-on: macos-15-intel
+          - arch: macosx_arm64
+            runs-on: macos-15
+          - arch: win_amd64
+            runs-on: windows-latest
+      fail-fast: false
+
+    runs-on: ${{ matrix.runs-on }}
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
-
-      - name: build
-        run: cmake --build build --config Release
-
-      - name: collect
-        shell: bash
-        run: |
-          mkdir -p dist
-          find build -name 'frameblender.${{ matrix.ext }}' -exec cp {} 'dist/frameblender-${{ matrix.name }}.${{ matrix.ext }}' \;
-          ls -l dist
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v7
         with:
-          name: frameblender-${{ matrix.name }}
-          path: dist/*
+          fetch-depth: 0
 
-      - name: upload to release
-        if: github.event_name == 'release'
-        shell: bash
+      # the wheels are py3-none, so one python is enough per platform
+      - uses: pypa/cibuildwheel@v4.1.0
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload '${{ github.event.release.tag_name }}' dist/* --clobber
+          CIBW_BUILD: cp314-*
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: uv
+          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=13
+          CIBW_TEST_REQUIRES: vapoursynth
+          CIBW_TEST_COMMAND: >-
+            python -c "from vapoursynth import core; print(core.frameblender.Isa());
+            core.frameblender.FrameBlend(core.std.BlankClip(length=10), weights=[1] * 41).get_frame(5)"
+        with:
+          output-dir: dist
+          extras: uv
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: frameblender-${{ matrix.arch }}
+          path: dist/*.whl
+
+  build-sdist:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - run: pipx run build --sdist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: frameblender-sdist
+          path: dist/*.tar.gz
+
+  publish:
+    needs: [build-wheels, build-sdist]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

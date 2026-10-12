@@ -1,4 +1,13 @@
 # vs-frameblender
+## Installing
+
+```
+pip install vapoursynth-frameblender
+```
+
+The wheel drops the plugin into `vapoursynth/plugins`, which VapourSynth R74+ autoloads from.
+Wheels are built for Windows x64, Linux x64/aarch64 and macOS x64/arm64.
+
 
 This is a shamelessly AI-written modification of the original [AverageFrames](https://github.com/vapoursynth/vapoursynth/blob/master/src/core/averageframesfilter.cpp) that removes the cap of 31 weights, adds a squared blend option, and attempts to improve performance.
 
