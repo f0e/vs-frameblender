@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(vs-frameblender LANGUAGES CXX)
+project(vs-frameblender VERSION 3.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -61,6 +61,8 @@ add_library(frameblender SHARED
 )
 
 target_include_directories(frameblender PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(frameblender PRIVATE
+    FB_VERSION_MAJOR=${PROJECT_VERSION_MAJOR} FB_VERSION_MINOR=${PROJECT_VERSION_MINOR})
 set_target_properties(frameblender PROPERTIES PREFIX "" OUTPUT_NAME "frameblender")
 
 if(MSVC)
