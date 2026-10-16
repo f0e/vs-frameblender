@@ -2,7 +2,7 @@
 ## Installing
 
 ```
-pip install vapoursynth-frameblender
+pip install vapoursynth-blur-frameblender
 ```
 
 The wheel drops the plugin into `vapoursynth/plugins`, which VapourSynth R74+ autoloads from.

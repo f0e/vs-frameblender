@@ -3,7 +3,7 @@ requires = ["scikit-build-core>=0.10"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "vapoursynth-frameblender"
+name = "vapoursynth-blur-frameblender"
 description = "Temporal weighted average for VapourSynth with no cap on the number of weights"
 readme = "README.md"
 requires-python = ">=3.12"
